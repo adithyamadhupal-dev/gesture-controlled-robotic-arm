@@ -176,7 +176,7 @@ def draw_robot_arm(surface, base, joint1, joint2, gripper_open=26):
     grip_angle = math.radians(a1 + a2 + a3)
     gx, gy = x3, y3
     hand_len = 42
-    spread = math.radians(22)
+    spread = math.radians(abs(gripper_open))
 
     left_tip = (
         gx + hand_len * math.cos(grip_angle + spread),
@@ -248,6 +248,13 @@ def main():
     target_j1 = joint1_angle
     target_j2 = joint2_angle
     target_grip = grip_angle
+
+    boxes = [
+    {"x": 180, "y": 260, "size": 40, "attached": False},
+    {"x": 320, "y": 220, "size": 40, "attached": False},
+    {"x": 450, "y": 280, "size": 40, "attached": False},
+    ]
+    held_box = None
 
     last_count = 0
     count_history = deque(maxlen=7)
@@ -326,12 +333,40 @@ def main():
                         status_label = "Lowering arm"
                         status_color = ORANGE
                     elif stable_count == 5:
-                        target_j1 = -58.0
-                        target_j2 = 52.0
-                        target_grip = -18.0
-                        status_label = "Resetting pose"
-                        status_color = YELLOW
+                        
+                        target_grip = 20
+                        if held_box is not None:
+
+                            held_box["attached"] = False
+                            held_box = None
+                        status_label = "opening gripper"
+                        status_color = GREEN
+                    elif stable_count == 0:
+
+                        target_grip = -45
+                        if held_box is None:
+
+                            for box in boxes:
+
+                                box_center_x = box["x"] + box["size"] / 2
+                                box_center_y = box["y"] + box["size"] / 2
+
+                                distance = math.hypot(
+                                    end_x - box_center_x,
+                                    end_y - box_center_y
+                                )
+
+                                if distance < 60:
+
+                                    box["attached"] = True
+                                    held_box = box
+                                    break
+
+                        status_label = "Closing gripper"
+                        status_color = ORANGE
+
                     else:
+
                         status_label = "Holding position"
                         status_color = MUTED
 
@@ -441,8 +476,12 @@ def main():
         pygame.draw.circle(screen, (27, 35, 56), (int(base_x), int(base_y + 18)), 58)
 
         # Robot arm
-        joints = draw_robot_arm(screen, (base_x, base_y), joint1_angle, joint2_angle)
+        joints = draw_robot_arm(screen,(base_x, base_y),joint1_angle,joint2_angle,grip_angle)
+        end_x, end_y = joints["end"]
+        if held_box is not None:
 
+            held_box["x"] = end_x - held_box["size"] / 2
+            held_box["y"] = end_y - held_box["size"] / 2
         # Small end-effector target marker
         ex, ey = joints["end"]
         pygame.draw.circle(screen, (255, 255, 255), (int(ex), int(ey)), 4)
@@ -452,6 +491,34 @@ def main():
         bubble = pygame.Rect(60, HEIGHT - 112, 360, 48)
         draw_round_rect(screen, (21, 26, 43), bubble, radius=18)
         draw_shadowed_text(screen, "Show your hand to control the arm", font_tiny, MUTED, (76, HEIGHT - 96))
+        for box in boxes:
+
+            box_center_x = box["x"] + box["size"] / 2
+            box_center_y = box["y"] + box["size"] / 2
+
+            distance = math.hypot(
+                end_x - box_center_x,
+                end_y - box_center_y
+            )
+
+            color = (255, 180, 50)
+            if box["attached"]:
+                color = (80, 200, 255)
+
+            if distance < 60:
+                color = (50, 255, 100)
+
+            pygame.draw.rect(
+                screen,
+                color,
+                (
+                    box["x"],
+                    box["y"],
+                    box["size"],
+                    box["size"]
+                ),
+                border_radius=6
+            )
 
         pygame.display.flip()
 
