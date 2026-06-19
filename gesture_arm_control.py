@@ -127,6 +127,60 @@ def arm_forward_kinematics(base, l1, l2, l3, a1, a2, a3):
     return (x1, y1), (x2, y2), (x3, y3)
 
 
+def _jacobian_numeric(base, l1, l2, l3, a1, a2, delta_deg=1.0):
+    """Numerical Jacobian of end-effector (x,y) w.r.t a1 and a2 (degrees -> radians handled).
+
+    Returns J as [[dx/da1, dx/da2], [dy/da1, dy/da2]] where derivatives are per radian.
+    """
+    p0 = arm_forward_kinematics(base, l1, l2, l3, a1, a2, -a2 * 0.55)[2]
+    delta_rad = math.radians(delta_deg)
+
+    p_a1 = arm_forward_kinematics(base, l1, l2, l3, a1 + delta_deg, a2, -(a2) * 0.55)[2]
+    p_a2 = arm_forward_kinematics(base, l1, l2, l3, a1, a2 + delta_deg, -(a2 + delta_deg) * 0.55)[2]
+
+    j11 = (p_a1[0] - p0[0]) / delta_rad
+    j21 = (p_a1[1] - p0[1]) / delta_rad
+
+    j12 = (p_a2[0] - p0[0]) / delta_rad
+    j22 = (p_a2[1] - p0[1]) / delta_rad
+
+    return [[j11, j12], [j21, j22]]
+
+
+def _ik_step_towards(base, l1, l2, l3, joint1_angle, joint2_angle, target_x, target_y, cur_tj1, cur_tj2, gain=0.6):
+    """Apply one Jacobian-transpose IK step toward target (returns new target_j1, target_j2, end_x, end_y).
+
+    - Angles are in degrees. gain scales the JT*error step (tuned small to avoid oscillation).
+    - Uses numeric Jacobian with a small delta.
+    """
+    # Current end-effector position
+    _, _, end = arm_forward_kinematics(base, l1, l2, l3, joint1_angle, joint2_angle, -joint2_angle * 0.55)
+    end_x, end_y = end
+
+    J = _jacobian_numeric(base, l1, l2, l3, joint1_angle, joint2_angle, delta_deg=1.0)
+
+    # J = [[dx/da1, dx/da2], [dy/da1, dy/da2]] (per radian)
+    # JT columns
+    jt_col0 = (J[0][0], J[1][0])
+    jt_col1 = (J[0][1], J[1][1])
+
+    ex = target_x - end_x
+    ey = target_y - end_y
+
+    # delta_theta (radians) = gain * JT * error (pixels)
+    dtheta0 = gain * (jt_col0[0] * ex + jt_col0[1] * ey)
+    dtheta1 = gain * (jt_col1[0] * ex + jt_col1[1] * ey)
+
+    # Convert to degrees for target_j updates
+    ddeg0 = math.degrees(dtheta0)
+    ddeg1 = math.degrees(dtheta1)
+
+    new_tj1 = clamp(cur_tj1 + ddeg0, -135, 35)
+    new_tj2 = clamp(cur_tj2 + ddeg1, -40, 120)
+
+    return new_tj1, new_tj2, end_x, end_y
+
+
 def draw_robot_arm(surface, base, joint1, joint2, gripper_open=26):
     # Realistic industrial-ish arm colors
     base_color = (52, 67, 88)
@@ -137,6 +191,7 @@ def draw_robot_arm(surface, base, joint1, joint2, gripper_open=26):
     highlight = (255, 255, 255)
 
     l1, l2, l3 = 190, 160, 85
+    l1, l2, l3 = 230, 190, 100
     a1, a2, a3 = joint1, joint2, -joint2 * 0.55
 
     p1, p2, p3 = arm_forward_kinematics(base, l1, l2, l3, a1, a2, a3)
@@ -249,12 +304,31 @@ def main():
     target_j2 = joint2_angle
     target_grip = grip_angle
 
+    ### Better Box Placement
     boxes = [
-    {"x": 180, "y": 260, "size": 40, "attached": False},
-    {"x": 320, "y": 220, "size": 40, "attached": False},
-    {"x": 450, "y": 280, "size": 40, "attached": False},
+        {"x": 320, "y": 380, "size": 40, "attached": False},
+        {"x": 420, "y": 330, "size": 40, "attached": False},
+        {"x": 520, "y": 280, "size": 40, "attached": False},
     ]
     held_box = None
+    robot_mode = "MANUAL"
+
+    auto_state = "IDLE"
+
+    auto_box = None
+
+    score = 0
+
+    drop_zone = {
+        "x": 500,
+        "y": 220,
+        "w": 120,
+        "h": 120
+    }
+
+    home_pose = (-58, 52)
+
+    open_palm_start = None
 
     last_count = 0
     count_history = deque(maxlen=7)
@@ -315,7 +389,7 @@ def main():
 
                 # Map gestures to arm targets with smooth motion
                 now = time.time()
-                if cooldown == 0.0 and now - last_action_time > 0.08:
+                if robot_mode == "MANUAL" and cooldown == 0.0 and now - last_action_time > 0.08:
                     if stable_count == 1:
                         target_j1 -= 3.0
                         status_label = "Turning base left"
@@ -333,18 +407,29 @@ def main():
                         status_label = "Lowering arm"
                         status_color = ORANGE
                     elif stable_count == 5:
-                        
-                        target_grip = 20
-                        if held_box is not None:
+                        # Require a sustained open palm to activate autonomous mode
+                        if open_palm_start is None:
+                            open_palm_start = time.time()
+                        elif time.time() - open_palm_start > 2.0:
+                            if robot_mode != "AUTO":
+                                robot_mode = "AUTO"
+                                auto_state = "SELECT_BOX"
+                                auto_box = None
+                                print("AUTO STARTED")
 
-                            held_box["attached"] = False
-                            held_box = None
-                        status_label = "opening gripper"
-                        status_color = GREEN
                     elif stable_count == 0:
 
                         target_grip = -45
                         if held_box is None:
+
+                            _, _, end_eff = arm_forward_kinematics(
+                                (base_x, base_y),
+                                230, 190, 100,
+                                joint1_angle,
+                                joint2_angle,
+                                -joint2_angle * 0.55
+                            )
+                            end_x, end_y = end_eff
 
                             for box in boxes:
 
@@ -369,6 +454,10 @@ def main():
 
                         status_label = "Holding position"
                         status_color = MUTED
+
+                    # reset open-palm timer if user is no longer showing open palm
+                    if stable_count != 5:
+                        open_palm_start = None
 
                     last_action_time = now
                     cooldown = 0.03
@@ -400,6 +489,116 @@ def main():
         joint1_angle = clamp(joint1_angle, -135, 35)
         joint2_angle = clamp(joint2_angle, -40, 120)
         grip_angle = clamp(grip_angle, -45, 20)
+        # ==================================================
+        # AUTONOMOUS CONTROLLER
+        # ==================================================
+
+        print(
+            "MODE =", robot_mode,
+            "| STATE =", auto_state,
+            "| AUTO_BOX =", auto_box is not None
+        )
+
+        # Compute the current end effector position before autonomous control.
+        _, _, end_pos = arm_forward_kinematics(
+            (base_x, base_y),
+            230, 190, 100,
+            joint1_angle,
+            joint2_angle,
+            -joint2_angle * 0.55
+        )
+        end_x, end_y = end_pos
+
+        # Autonomous state-machine controller using Jacobian-transpose IK steps
+        if robot_mode == "AUTO":
+
+            if auto_state == "SELECT_BOX":
+                # choose nearest unattached box to end-effector
+                best = None
+                best_d = float("inf")
+                for box in boxes:
+                    if not box["attached"]:
+                        bx = box["x"] + box["size"] / 2
+                        by = box["y"] + box["size"] / 2
+                        d = math.hypot(end_x - bx, end_y - by)
+                        if d < best_d:
+                            best = box
+                            best_d = d
+                if best is None:
+                    # nothing to do
+                    robot_mode = "MANUAL"
+                    auto_state = "IDLE"
+                    auto_box = None
+                else:
+                    auto_box = best
+                    auto_state = "MOVE_TO_BOX"
+
+            elif auto_state == "MOVE_TO_BOX" and auto_box is not None:
+                tx = auto_box["x"] + auto_box["size"] / 2
+                ty = auto_box["y"] + auto_box["size"] / 2
+
+                # IK step to move both joints toward the target
+                target_j1, target_j2, end_x, end_y = _ik_step_towards(
+                    (base_x, base_y), 230, 190, 100,
+                    joint1_angle, joint2_angle,
+                    tx, ty,
+                    target_j1, target_j2,
+                    gain=0.8,
+                )
+
+                distance = math.hypot(end_x - tx, end_y - ty)
+                print("DISTANCE =", int(distance))
+
+                if distance < 45:
+                    auto_state = "GRAB"
+
+            elif auto_state == "GRAB":
+                target_grip = -45
+                if auto_box is not None:
+                    auto_box["attached"] = True
+                    held_box = auto_box
+                auto_state = "MOVE_TO_DROP"
+
+            elif auto_state == "MOVE_TO_DROP":
+                tx = drop_zone["x"] + drop_zone["w"] / 2
+                ty = drop_zone["y"] + drop_zone["h"] / 2
+
+                target_j1, target_j2, end_x, end_y = _ik_step_towards(
+                    (base_x, base_y), 230, 190, 100,
+                    joint1_angle, joint2_angle,
+                    tx, ty,
+                    target_j1, target_j2,
+                    gain=0.8,
+                )
+                distance = math.hypot(end_x - tx, end_y - ty)
+
+                if distance < 50:
+                    auto_state = "RELEASE"
+
+            elif auto_state == "RELEASE":
+                target_grip = 20
+                if held_box is not None:
+                    held_box["attached"] = False
+                    # place centered inside drop zone
+                    held_box["x"] = drop_zone["x"] + (drop_zone["w"] - held_box["size"]) / 2
+                    held_box["y"] = drop_zone["y"] + (drop_zone["h"] - held_box["size"]) / 2
+                    held_box = None
+                    score += 1
+                auto_state = "RETURN_HOME"
+
+            elif auto_state == "RETURN_HOME":
+                # Move targets toward home_joint pose smoothly
+                target_j1 = lerp(target_j1, home_pose[0], 0.12)
+                target_j2 = lerp(target_j2, home_pose[1], 0.12)
+
+                if (
+                    abs(joint1_angle - home_pose[0]) < 3
+                    and
+                    abs(joint2_angle - home_pose[1]) < 3
+                ):
+                    auto_state = "IDLE"
+                    robot_mode = "MANUAL"
+                    auto_box = None
 
         # ------------------------
         # DRAW UI BACKGROUND
@@ -441,8 +640,28 @@ def main():
         label_rect = pygame.Rect(CAM_W + 34, 352, PANEL_W - 68, 52)
         draw_round_rect(screen, (35, 47, 73), label_rect, radius=16)
         draw_shadowed_text(screen, f"Gesture: {gesture_label}", font_med, ACCENT_2, (CAM_W + 48, 364))
+        mode_text = font_med.render(
+            f"Mode: {robot_mode}",
+            True,
+            WHITE
+        )
 
+        screen.blit(
+            mode_text,
+            (CAM_W + 35, 410)
+        )
         # Control legend
+        score_text = font_med.render(
+            f"Tasks Completed: {score}",
+            True,
+            WHITE
+        )
+
+        screen.blit(
+            score_text,
+            (CAM_W + 35, 440)
+        )
+
         draw_shadowed_text(screen, "Controls", font_med, TEXT, (CAM_W + 34, 470))
         legend = [
             ("1 finger", "Rotate base left"),
@@ -478,7 +697,7 @@ def main():
         # Robot arm
         joints = draw_robot_arm(screen,(base_x, base_y),joint1_angle,joint2_angle,grip_angle)
         end_x, end_y = joints["end"]
-        if held_box is not None:
+        if held_box is not None and held_box["attached"]:
 
             held_box["x"] = end_x - held_box["size"] / 2
             held_box["y"] = end_y - held_box["size"] / 2
@@ -491,6 +710,31 @@ def main():
         bubble = pygame.Rect(60, HEIGHT - 112, 360, 48)
         draw_round_rect(screen, (21, 26, 43), bubble, radius=18)
         draw_shadowed_text(screen, "Show your hand to control the arm", font_tiny, MUTED, (76, HEIGHT - 96))
+        pygame.draw.rect(
+            screen,
+            (70, 220, 120),
+            (
+                drop_zone["x"],
+                drop_zone["y"],
+                drop_zone["w"],
+                drop_zone["h"]
+            ),
+            border_radius=12
+        )
+
+        label = font_small.render(
+            "DROP ZONE",
+            True,
+            (255,255,255)
+        )
+
+        screen.blit(
+            label,
+            (
+                drop_zone["x"] + 12,
+                drop_zone["y"] + 18
+            )
+        )
         for box in boxes:
 
             box_center_x = box["x"] + box["size"] / 2
